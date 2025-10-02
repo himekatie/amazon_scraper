@@ -4,7 +4,9 @@ const chromium = require("@sparticuz/chromium");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
+app.get("/", (req, res) => {
+  res.json({ status: "ok" });
+});
 app.get("/scrape", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: "Missing ?url=" });
