@@ -1,5 +1,6 @@
 const express = require("express");
-const puppeteer = require("puppeteer");
+const puppeteer = require("puppeteer-core");
+const chromium = require("@sparticuz/chromium");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -10,17 +11,18 @@ app.get("/scrape", async (req, res) => {
 
   try {
     const browser = await puppeteer.launch({
-      headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+      args: chromium.args,
+      defaultViewport: chromium.defaultViewport,
+      executablePath: await chromium.executablePath(), // Render finds Chromium here
+      headless: chromium.headless,
     });
+
     const page = await browser.newPage();
     await page.goto(url, { waitUntil: "domcontentloaded" });
 
-    // Grab title and price
     const data = await page.evaluate(() => {
       const title = document.querySelector("#productTitle")?.innerText.trim();
-      const price =
-        document.querySelector("span.a-offscreen")?.innerText.trim();
+      const price = document.querySelector("span.a-offscreen")?.innerText.trim();
       return { title, price };
     });
 
