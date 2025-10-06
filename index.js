@@ -1,8 +1,16 @@
 const express = require("express");
 const axios = require("axios");
 const cheerio = require("cheerio");
-const puppeteer = require("puppeteer-core");
-const chromium = require("@sparticuz/chromium");
+// Decide runtime: Render/serverless vs local
+const isServerEnv = Boolean(process.env.RENDER || process.env.AWS_REGION || process.env.AWS_EXECUTION_ENV);
+let puppeteer;
+let chromium;
+if (isServerEnv) {
+  puppeteer = require("puppeteer-core");
+  chromium = require("@sparticuz/chromium");
+} else {
+  puppeteer = require("puppeteer");
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -17,6 +25,10 @@ async function scrapeWithAxios(url) {
       "User-Agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       "Accept-Language": "en-US,en;q=0.9",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Encoding": "gzip, deflate, br",
+      "Cache-Control": "no-cache",
+      "Pragma": "no-cache",
     },
   });
 
@@ -28,16 +40,40 @@ async function scrapeWithAxios(url) {
   return { title, price };
 }
 
-async function scrapeWithPuppeteer(url) {
-  const browser = await puppeteer.launch({
-    args: chromium.args,
-    defaultViewport: chromium.defaultViewport,
-    executablePath: await chromium.executablePath(),
-    headless: chromium.headless,
+async function launchBrowser() {
+  if (isServerEnv) {
+    return puppeteer.launch({
+      args: chromium.args,
+      defaultViewport: chromium.defaultViewport,
+      executablePath: await chromium.executablePath(),
+      headless: chromium.headless,
+    });
+  }
+  return puppeteer.launch({
+    headless: true,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+    ],
   });
+}
+
+async function scrapeWithPuppeteer(url) {
+  const browser = await launchBrowser();
 
   const page = await browser.newPage();
+  await page.setUserAgent(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+  );
+  await page.setExtraHTTPHeaders({ "accept-language": "en-US,en;q=0.9" });
   await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+  // Wait for either title or an error block
+  await Promise.race([
+    page.waitForSelector("#productTitle", { timeout: 15000 }).catch(() => null),
+    page.waitForSelector("#dp", { timeout: 15000 }).catch(() => null),
+  ]);
 
   const data = await page.evaluate(() => {
     const title = document.querySelector("#productTitle")?.innerText.trim();
