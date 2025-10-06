@@ -2,7 +2,15 @@ const express = require("express");
 const axios = require("axios");
 const cheerio = require("cheerio");
 // Decide runtime: Render/serverless vs local
-const isServerEnv = Boolean(process.env.RENDER || process.env.AWS_REGION || process.env.AWS_EXECUTION_ENV);
+const isServerEnv = Boolean(
+  process.env.RENDER_EXTERNAL_URL ||
+  process.env.AWS_REGION ||
+  process.env.AWS_EXECUTION_ENV ||
+  process.env.VERCEL ||
+  process.env.GOOGLE_FUNCTION_TARGET ||
+  process.env.PUPPETEER_EXECUTABLE_PATH ||
+  process.env.CHROME_PATH
+);
 let puppeteer;
 let chromium;
 if (isServerEnv) {
@@ -191,4 +199,4 @@ app.get("/scrape", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.listen(PORT, "0.0.0.0", () => console.log(`🚀 Server running on port ${PORT}`));
