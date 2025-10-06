@@ -1,6 +1,7 @@
 const express = require("express");
 const axios = require("axios");
 const cheerio = require("cheerio");
+const { google } = require("googleapis");
 // Decide runtime: Render/serverless vs local
 const isServerEnv = Boolean(
   process.env.RENDER_EXTERNAL_URL ||
@@ -177,6 +178,48 @@ async function scrapeWithPuppeteer(url) {
   return data;
 }
 
+async function getSheetsClient() {
+  let credsJson = process.env.GOOGLE_CREDENTIALS;
+  const credsB64 = process.env.GOOGLE_CREDENTIALS_BASE64;
+  if (!credsJson && credsB64) {
+    try {
+      credsJson = Buffer.from(credsB64, "base64").toString("utf8");
+    } catch (e) {
+      throw new Error("GOOGLE_CREDENTIALS_BASE64 is not valid base64");
+    }
+  }
+  if (!credsJson) throw new Error("Missing GOOGLE_CREDENTIALS (or GOOGLE_CREDENTIALS_BASE64) env var");
+
+  let creds;
+  try {
+    creds = JSON.parse(credsJson);
+  } catch (e) {
+    throw new Error("Credentials env is not valid JSON");
+  }
+
+  const auth = new google.auth.JWT(
+    creds.client_email,
+    null,
+    creds.private_key,
+    ["https://www.googleapis.com/auth/spreadsheets"]
+  );
+  await auth.authorize();
+  return google.sheets({ version: "v4", auth });
+}
+
+function shortenTitleForSheet(raw) {
+  if (!raw) return "";
+  let t = String(raw);
+  t = t.replace(/^Amazon\.com:\s*/i, "");
+  t = t.replace(/\bby\s+[A-Z0-9][\w\s&-]+$/i, "");
+  t = t.replace(/\s*\|\s*.*$/i, "");
+  t = t.replace(/\(.*?\)|\[.*?\]|\{.*?\}/g, "");
+  t = t.replace(/\s{2,}/g, " ").trim();
+  const maxLen = Number(process.env.TITLE_MAX_LEN || 60);
+  if (t.length > maxLen) t = t.slice(0, maxLen - 1).trim() + "…";
+  return t;
+}
+
 app.get("/scrape", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: "Missing ?url=" });
@@ -196,6 +239,66 @@ app.get("/scrape", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Scraping failed", details: err.message });
+  }
+});
+
+app.post("/sync", async (req, res) => {
+  try {
+    const spreadsheetId = process.env.SHEET_ID;
+    const sheetName = process.env.SHEET_NAME || "Sheet1";
+    const startRow = Number(process.env.START_ROW || 4);
+    if (!spreadsheetId) throw new Error("Missing SHEET_ID env var");
+
+    const sheets = await getSheetsClient();
+
+    // 1) Read URLs from I
+    const readRange = `${sheetName}!I${startRow}:I`;
+    const readResp = await sheets.spreadsheets.values.get({ spreadsheetId, range: readRange });
+    const urlRows = readResp.data.values || [];
+
+    // 2) Fetch scrape results in parallel
+    const base = process.env.SCRAPER_BASE || (process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`);
+    const fetches = urlRows.map(async (row) => {
+      const url = (row && row[0]) || "";
+      if (!url) return ["", ""];
+      try {
+        const resp = await axios.get(`${base}/scrape`, { params: { url } });
+        const data = resp.data || {};
+        if (data.error) return [
+          `ERR: ${data.details || data.error}`,
+          ""
+        ];
+        return [shortenTitleForSheet(data.title || ""), data.price || ""];
+      } catch (e) {
+        return [`ERR: ${e.message}`, ""];
+      }
+    });
+    const results = await Promise.all(fetches);
+
+    // 3) Write Title (E) and Price (G)
+    const titles = results.map(r => [r[0]]);
+    const prices = results.map(r => [r[1]]);
+
+    const writeTitleRange = `${sheetName}!E${startRow}:E`;
+    const writePriceRange = `${sheetName}!G${startRow}:G`;
+
+    await sheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: writeTitleRange,
+      valueInputOption: "RAW",
+      requestBody: { values: titles }
+    });
+    await sheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: writePriceRange,
+      valueInputOption: "RAW",
+      requestBody: { values: prices }
+    });
+
+    res.json({ ok: true, rows: results.length });
+  } catch (err) {
+    console.error("/sync error", err);
+    res.status(500).json({ error: "sync_failed", details: err.message });
   }
 });
 
