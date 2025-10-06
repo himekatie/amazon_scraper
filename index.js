@@ -29,6 +29,8 @@ async function scrapeWithAxios(url) {
       "Accept-Encoding": "gzip, deflate, br",
       "Cache-Control": "no-cache",
       "Pragma": "no-cache",
+      "Referer": "https://www.google.com/",
+      "Upgrade-Insecure-Requests": "1",
     },
   });
 
@@ -40,16 +42,33 @@ async function scrapeWithAxios(url) {
   return { title, price };
 }
 
+async function retry(fn, { retries = 3, delayMs = 500 } = {}) {
+  let lastErr;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const msg = String(err && err.message || err);
+      // Only retry for transient filesystem/launch issues
+      if (!/ETXTBSY|EBUSY|ECONNRESET|ENOTFOUND|EAGAIN/i.test(msg)) break;
+      await new Promise(r => setTimeout(r, delayMs * attempt));
+    }
+  }
+  throw lastErr;
+}
+
 async function launchBrowser() {
   if (isServerEnv) {
-    return puppeteer.launch({
+    const execPath = await chromium.executablePath();
+    return retry(() => puppeteer.launch({
       args: chromium.args,
       defaultViewport: chromium.defaultViewport,
-      executablePath: await chromium.executablePath(),
+      executablePath: execPath,
       headless: chromium.headless,
-    });
+    }), { retries: 4, delayMs: 700 });
   }
-  return puppeteer.launch({
+  return retry(() => puppeteer.launch({
     headless: true,
     args: [
       "--no-sandbox",
@@ -57,27 +76,91 @@ async function launchBrowser() {
       "--disable-dev-shm-usage",
       "--disable-gpu",
     ],
-  });
+  }), { retries: 2, delayMs: 500 });
+}
+
+async function prepareAmazonPage(page) {
+  await page.setUserAgent(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+  );
+  await page.setExtraHTTPHeaders({ "accept-language": "en-US,en;q=0.9", referer: "https://www.google.com/" });
+  await page.setViewport({ width: 1366, height: 768 });
+}
+
+function ensureLanguageParam(url) {
+  try {
+    const u = new URL(url);
+    if (!u.searchParams.has("language")) {
+      u.searchParams.set("language", "en_US");
+    }
+    return u.toString();
+  } catch {
+    return url;
+  }
+}
+
+async function maybeAcceptConsent(page) {
+  // Common Amazon cookie consent selectors
+  const consentSelectors = [
+    "#sp-cc-accept",
+    "input[name=accept]",
+    "#aee-cookie-banner-accept",
+    "button[name=accept]",
+  ];
+  for (const sel of consentSelectors) {
+    const btn = await page.$(sel);
+    if (btn) {
+      await btn.click().catch(() => {});
+      await page.waitForTimeout(1000);
+      break;
+    }
+  }
+}
+
+async function isCaptcha(page) {
+  return Boolean(
+    await page.$("#captchacharacters, form[action*=validateCaptcha], .captcha-page")
+  );
+}
+
+async function waitForTitle(page, timeoutMs = 30000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const hasTitle = await page.$("#productTitle");
+    if (hasTitle) return true;
+    await page.waitForTimeout(500);
+  }
+  return false;
 }
 
 async function scrapeWithPuppeteer(url) {
   const browser = await launchBrowser();
-
   const page = await browser.newPage();
-  await page.setUserAgent(
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-  );
-  await page.setExtraHTTPHeaders({ "accept-language": "en-US,en;q=0.9" });
-  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
-  // Wait for either title or an error block
-  await Promise.race([
-    page.waitForSelector("#productTitle", { timeout: 15000 }).catch(() => null),
-    page.waitForSelector("#dp", { timeout: 15000 }).catch(() => null),
-  ]);
+  await prepareAmazonPage(page);
+
+  let targetUrl = ensureLanguageParam(url);
+  await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+
+  await maybeAcceptConsent(page);
+  if (await isCaptcha(page)) {
+    await browser.close();
+    throw new Error("Encountered Amazon captcha page");
+  }
+
+  const found = await waitForTitle(page, 30000);
+
+  // Fallback: try scrolling and extra wait
+  if (!found) {
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 3));
+    await page.waitForTimeout(1500);
+  }
 
   const data = await page.evaluate(() => {
-    const title = document.querySelector("#productTitle")?.innerText.trim();
-    const price = document.querySelector("span.a-offscreen")?.innerText.trim();
+    const normalize = (s) => (s || "").replace(/\s+/g, " ").trim();
+    const title = normalize(document.querySelector("#productTitle")?.textContent);
+    // Prefer price inside core price block when available
+    const priceSel = document.querySelector("#corePriceDisplay_desktop_feature_div span.a-offscreen") || document.querySelector("span.a-offscreen");
+    const price = normalize(priceSel?.textContent);
     return { title, price };
   });
 
